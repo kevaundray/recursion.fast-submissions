@@ -47,8 +47,11 @@ suspicious door was checked against the contract, the harness code and the gate:
   sabotage of the organiser's measurement, not a submission. Everything legal that
   changes `g = 1 + (V̄ₘ/v_ref)²` is making `V` faster.
 - **What is left is the frontier itself.** With witness sending, `S× = P̄ · g` where
-  `P̄` is one serial chain walk and `g` is quadratic in the mean check time. Both
-  factors are engineering floors on the same operation: the serial Keccak-f walk.
+  `P̄` is one serial chain walk and `g` is quadratic in the mean check time; under the
+  sum, `V̄` alone is ≥ `κ · (meanV/v_ref)` ≈ 20 s at the organiser checker's speed.
+  Both factors are engineering floors on the same operation: the serial Keccak-f walk.
+  (The witness-sending product play itself is #12's; this entry does not push that
+  axis further — its contribution is the map and the prover below.)
 
 ### The prover
 
@@ -94,14 +97,11 @@ Local, this machine (Ryzen 9 7950X3D, Zen 4 as the evaluation machine; a desktop
   entry projects to `S ≈ 95`, `S× ≈ 77`. The smoke (`harness/smoke.toml`) is ACCEPT
   too. Far from both records: the run is `accepted` at best, and the numbers measure
   exactly why — the verifier term dominates everything about witness sending.
-- A fast `V` is what the product track really prices: with relay-echo-class compiled
-  checks (~267 ns/perm → `g ≈ 41`) even this prover would score `S× ≈ 3.7`; with the
-  library's `V` (`g ≈ 800+`) nothing about the prover matters. The verifier work
-  (word-level chain loop over `KeccakFast.keccakFF`, then the round-as-loop rewrite,
-  each proved equal) is the next entry's main cost, and this entry's numbers measure
-  the trade exactly.
-
-The evaluation's verdict and scores: see the published result of this PR.
+- A word-level rewrite of the verifier's chain (a prototype, its round lemma fully
+  proved; see *What to try next*) runs the same step-96 check **1.31× faster**: 48.8 s
+  vs 63.7 s locally (1.52 vs 1.99 µs per permutation of history). It still leaves
+  `V̄` an order above the records' verifier terms: witness sending cannot reach either
+  track's record, only a succinct verifier can (see next).
 
 ## What failed, and why
 
@@ -129,6 +129,15 @@ The evaluation's verdict and scores: see the published result of this PR.
   toy prover source, and the per-request self-check compares against the portable
   kernel, which shares the table too — the KAT that catches this class is
   `Keccak-256("")`, checked at setup in dev builds.
+- **Lean-side, the same class**: `laneAt`'s offset is in **bytes**, not lanes
+  (`digestW` must read offsets 0/8/16/24, not 0/1/2/3 — a wrong `digestW` still passed
+  the structure checks and failed only the real proof); and a 25-field structure
+  literal hand-counted its zero fields once (the block's lane 16 ended up one field
+  short). Both were found by evaluating one step against `chainEndF`.
+- **Timed Lean evaluations must be forced inside the window**: `let r := check' …`
+  between two `IO.monoNanosNow` reports 20 ns — the thunk is forced later (or CSE'd
+  with an earlier identical call). The badge's reference trick (`IO.mkRef` on both
+  sides) is not optional; a probe without it measured nothing twice.
 - **Two SIGNs per step are unnecessary** (one serves the leaf child and the output, see
   above), and copying the previous step's sigma would work too — but the rules say one
   `SIGN` per output proof, so this entry makes exactly one per output.
@@ -140,16 +149,35 @@ The evaluation's verdict and scores: see the published result of this PR.
 
 ## What to try next
 
-1. **Generate the asm, not the C.** The same symbolic generator can emit x86-64
+1. **The verifier rewrite is started, and its proof route is validated.** Two
+   prototypes (not in this root), both agreeing with the library on the real step-96
+   proof: (a) a word-tuple chain loop over the library's `keccakFF` — 48.8 s per
+   check, 1.31× faster, the sponge's per-step `digestB` (allocation, 136
+   bounds-checked byte reads, `padB`'s two array copies) removed; (b) a 25-word-vector
+   round `roundL` **proved equal to the library's round with no sorries**
+   (`roundL_eq_roundF`: `interval_cases` on the lane, then `rfl`, because the
+   generated lane expressions mirror `thetaF`/`rhoF`/`piF`/`chiF` structurally;
+   `keccakFL_eq` by a one-line fold induction) — but as written it is **3.3× slower**
+   (210 s): a per-lane closed form has no shared subterms, so every lane re-evaluates
+   its column parities and its chi neighbours' theta strings (~17× the operations).
+   The fix is mechanical — `let`-bind the five parities, five `D`s and twenty-five
+   rho-pi lanes inside `roundL`, mirroring `thetaF`'s own `let`s — and the `rfl`-per-lane
+   proof route survives it. What remains beyond that: the one-step bridge
+   `block43 (digestW s) = xorBlock zeroS (padB (0x43‖s)) 0` (~136 `padB` byte cases
+   plus the word/byte reassembly lemma) and the `check' = check` transfer. That is the
+   whole of #12's verifier ladder minus its last rung — but note it only matters under
+   the product, which #12 already owns.
+2. **Generate the prover's asm, not the C.** The same symbolic generator can emit x86-64
    directly (explicit xmm assignment, `vprolq`/`vpternlogq`/`vpxorq` interleaved across
    rounds to cover both 2/cycle classes). The measured gap to the floor is pure
    codegen: ~1260 C-generated vs ~730 hand-generated cycles.
-2. **The fast `V`, in two steps.** (a) A word-level chain loop over the library's
-   `keccakFF` with the padded `0x43‖d` block built directly in lanes: one bridge proof
-   (`block43 = xorBlock zeroS (padB ·) 0`, ~136 byte cases), then induction — ≈ 450
-   ns/perm, `g ≈ 115`. (b) The round-as-loop rewrite over 25 unboxed words proved
-   equal to `keccakFF` (the #12 route), ≈ 267 ns/perm, `g ≈ 41`. With (b) and a
-   730-cycle prover, `S× ≈ 2.2`; with a 600-cycle one, under 1.9.
-3. **The iota-fusion and a sparse first round** (the state after absorbing `0x43‖d` has
-   20 zero lanes; round 0's column parities are just the five rate lanes) are worth
-   ~2-3% of the prover and were skipped here.
+3. **The sum is where witness sending is hopeless and the SNARK is not.** The sum
+   record is leanVM's system (#11 → #13); its own notes list the lever nobody has
+   taken: the chain table is always 2^20 rows, so every chain of n < 2^20 proves at
+   full size. With the 1/n² length distribution, 57% of chains fit a 2^18 table and
+   86% fit 2^19: a shape mux cuts the mean GKR work to ≈ 0.43× and, through P̄'s cubic
+   mean (which is what makes small-n steps at full shape so expensive), the prover
+   term by roughly half — several seconds of S. It is certificate work (per-shape
+   tables, schedules and kernel-decided facts, and `V`'s dispatch), not prover-only,
+   so it is a real project — but it is the largest published, untaken lever on either
+   track.
